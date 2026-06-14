@@ -16,6 +16,15 @@ struct Tokens: Equatable {
                cacheCreate: a.cacheCreate + b.cacheCreate,
                cacheRead: a.cacheRead + b.cacheRead)
     }
+    /// The single number a percentage is measured against.
+    func value(_ m: Metric) -> Int { m == .total ? total : input + output }
+}
+
+/// Which token figure the limit percentages are computed from.
+enum Metric: String, CaseIterable {
+    case realUsage
+    case total
+    var label: String { self == .realUsage ? "Input+Output" : "All tokens" }
 }
 
 /// One usage record parsed from a transcript line.
@@ -56,9 +65,24 @@ final class UsageStore: ObservableObject {
     @Published var lastUpdated = Date()
     @Published var isRefreshing = false
 
+    // User-defined limits (in millions of tokens) and which metric drives percentages.
+    @Published var metric: Metric {
+        didSet { UserDefaults.standard.set(metric.rawValue, forKey: "metric") }
+    }
+    @Published var sessionLimitM: Double {
+        didSet { UserDefaults.standard.set(sessionLimitM, forKey: "sessionLimitM") }
+    }
+    @Published var weeklyLimitM: Double {
+        didSet { UserDefaults.standard.set(weeklyLimitM, forKey: "weeklyLimitM") }
+    }
+
     private var timer: Timer?
 
     init() {
+        let d = UserDefaults.standard
+        metric = Metric(rawValue: d.string(forKey: "metric") ?? "") ?? .realUsage
+        sessionLimitM = d.object(forKey: "sessionLimitM") as? Double ?? 1
+        weeklyLimitM = d.object(forKey: "weeklyLimitM") as? Double ?? 5
         refresh()
         // Recompute every 60s; also keeps the reset countdown roughly current.
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
@@ -66,9 +90,14 @@ final class UsageStore: ObservableObject {
         }
     }
 
-    /// Short label shown in the menu bar: real consumption (input + output) this 5h window.
+    var sessionLimit: Int { Int(sessionLimitM * 1_000_000) }
+    var weeklyLimit: Int { Int(weeklyLimitM * 1_000_000) }
+
+    /// Menu bar label: percent of the session limit (chosen metric). Falls back to a count.
     var menuLabel: String {
-        fmtTokens(session.input + session.output)
+        guard sessionLimit > 0 else { return fmtTokens(session.value(metric)) }
+        let pct = Int((Double(session.value(metric)) / Double(sessionLimit) * 100).rounded())
+        return "\(pct)%"
     }
 
     func refresh() {
@@ -236,23 +265,42 @@ struct StackedBar: View {
     }
 }
 
-/// One window (Session / Week) with its stacked bar and per-category rows. No combined total.
+/// One window (Session / Week) with its percent-of-limit, stacked bar, and per-category rows.
 struct WindowView: View {
     let title: String
     let subtitle: String?
     let t: Tokens
+    let limitTokens: Int
+    let metric: Metric
 
     private let labels = ["Input", "Output", "Cache write", "Cache read"]
     private var values: [Int] { [t.input, t.output, t.cacheCreate, t.cacheRead] }
+    private var frac: Double? {
+        limitTokens > 0 ? min(1, Double(t.value(metric)) / Double(limitTokens)) : nil
+    }
+    private var color: Color {
+        guard let f = frac else { return .secondary }
+        return f >= 0.9 ? .red : (f >= 0.7 ? .orange : .green)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack {
+            HStack(spacing: 6) {
                 Text(title).font(.system(size: 12, weight: .semibold))
-                Spacer()
                 if let subtitle {
                     Text(subtitle).font(.system(size: 10)).foregroundStyle(.secondary)
                 }
+                Spacer()
+                if let f = frac {
+                    Text("\(Int((f * 100).rounded()))%")
+                        .font(.system(size: 11, weight: .medium, design: .rounded))
+                        .foregroundStyle(color)
+                }
+            }
+            if let f = frac {
+                ProgressView(value: f).tint(color)
+                Text("\(fmtTokens(t.value(metric))) / \(fmtTokens(limitTokens)) tokens")
+                    .font(.system(size: 9)).foregroundStyle(.secondary)
             }
             StackedBar(t: t)
             VStack(spacing: 3) {
@@ -267,6 +315,47 @@ struct WindowView: View {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Editable limits and the metric the percentages are based on.
+struct SettingsSection: View {
+    @EnvironmentObject var store: UsageStore
+    @State private var expanded = false
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $expanded) {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("Percent of").font(.system(size: 11))
+                    Spacer()
+                    Picker("", selection: $store.metric) {
+                        ForEach(Metric.allCases, id: \.self) { Text($0.label).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(width: 170)
+                }
+                limitField("Session limit (5h)", value: $store.sessionLimitM)
+                limitField("Weekly limit", value: $store.weeklyLimitM)
+                Text("Limits in millions of tokens. Percent = chosen metric ÷ limit. These are your own targets — Anthropic doesn't publish exact seat limits.")
+                    .font(.system(size: 9)).foregroundStyle(.secondary)
+            }.padding(.top, 4)
+        } label: {
+            Text("Settings").font(.system(size: 12, weight: .semibold))
+        }
+    }
+
+    func limitField(_ label: String, value: Binding<Double>) -> some View {
+        HStack {
+            Text(label).font(.system(size: 11))
+            Spacer()
+            TextField("", value: value, format: .number)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 70)
+                .multilineTextAlignment(.trailing)
+            Text("M").font(.system(size: 10)).foregroundStyle(.secondary)
         }
     }
 }
@@ -288,23 +377,31 @@ struct MenuContent: View {
 
             WindowView(title: "Session (5h window)",
                        subtitle: store.blockEnd.map(fmtCountdown) ?? "idle — reset",
-                       t: store.session)
+                       t: store.session,
+                       limitTokens: store.sessionLimit,
+                       metric: store.metric)
 
             Divider()
 
             WindowView(title: "This week",
                        subtitle: "rolling 7 days",
-                       t: store.week)
+                       t: store.week,
+                       limitTokens: store.weeklyLimit,
+                       metric: store.metric)
 
             HStack {
                 Text("Today").font(.system(size: 12, weight: .semibold))
                 Spacer()
-                Text("\(fmtTokens(store.today.input + store.today.output)) in+out")
+                Text("\(fmtTokens(store.today.value(store.metric))) tokens")
                     .font(.system(size: 11)).monospacedDigit().foregroundStyle(.secondary)
             }
 
-            Text("Token counts from local transcripts. Not the same as your plan's % usage, which Anthropic computes server-side.")
+            Text("Token counts from local transcripts. Percent is vs your own limits below — not your plan's % usage, which Anthropic computes server-side.")
                 .font(.system(size: 9)).foregroundStyle(.secondary)
+
+            Divider()
+
+            SettingsSection()
 
             Divider()
 
