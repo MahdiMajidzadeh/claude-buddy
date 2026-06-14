@@ -43,56 +43,6 @@ private struct Line: Decodable {
     }
 }
 
-// MARK: - Admin API (official org usage report)
-
-/// Minimal decoding of GET /v1/organizations/usage_report/messages.
-private struct OrgReport: Decodable {
-    let data: [Bucket]
-    struct Bucket: Decodable {
-        let starting_at: String
-        let results: [Result]
-    }
-    struct Result: Decodable {
-        let uncached_input_tokens: Int?
-        let output_tokens: Int?
-        let cache_read_input_tokens: Int?
-        let cache_creation: CacheCreation?
-    }
-    struct CacheCreation: Decodable {
-        let ephemeral_1h_input_tokens: Int?
-        let ephemeral_5m_input_tokens: Int?
-    }
-}
-
-struct OrgError: Error { let message: String; init(_ m: String) { message = m } }
-
-/// Stores the admin key in the macOS Keychain (never in plaintext on disk).
-enum Keychain {
-    private static let service = "local.claude.usage.menubar"
-    private static let account = "anthropic-admin-key"
-    private static func base() -> [String: Any] {
-        [kSecClass as String: kSecClassGenericPassword,
-         kSecAttrService as String: service,
-         kSecAttrAccount as String: account]
-    }
-    static func save(_ value: String) {
-        SecItemDelete(base() as CFDictionary)
-        var add = base()
-        add[kSecValueData as String] = value.data(using: .utf8)!
-        SecItemAdd(add as CFDictionary, nil)
-    }
-    static func load() -> String? {
-        var q = base()
-        q[kSecReturnData as String] = true
-        q[kSecMatchLimit as String] = kSecMatchLimitOne
-        var item: CFTypeRef?
-        guard SecItemCopyMatching(q as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data else { return nil }
-        return String(data: data, encoding: .utf8)
-    }
-    static func delete() { SecItemDelete(base() as CFDictionary) }
-}
-
 // MARK: - Store
 
 @MainActor
@@ -106,18 +56,10 @@ final class UsageStore: ObservableObject {
     @Published var lastUpdated = Date()
     @Published var isRefreshing = false
 
-    // Official Admin API org usage (developer platform — not the seat plan %).
-    @Published var orgConfigured = false
-    @Published var orgWeek = Tokens()
-    @Published var orgToday = Tokens()
-    @Published var orgStatus = "Not configured"
-
     private var timer: Timer?
 
     init() {
-        orgConfigured = Keychain.load() != nil
         refresh()
-        if orgConfigured { refreshOrg() }
         // Recompute every 60s; also keeps the reset countdown roughly current.
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
             Task { @MainActor [weak self] in self?.refresh() }
@@ -143,82 +85,6 @@ final class UsageStore: ObservableObject {
                 self.isRefreshing = false
             }
         }
-    }
-
-    // MARK: Admin API
-
-    func saveOrgKey(_ key: String) {
-        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        Keychain.save(trimmed)
-        orgConfigured = true
-        orgStatus = "Loading…"
-        refreshOrg()
-    }
-
-    func clearOrgKey() {
-        Keychain.delete()
-        orgConfigured = false
-        orgWeek = Tokens(); orgToday = Tokens()
-        orgStatus = "Not configured"
-    }
-
-    func refreshOrg() {
-        guard let key = Keychain.load() else { orgStatus = "Not configured"; return }
-        orgStatus = "Loading…"
-        Task {
-            do {
-                let (week, today) = try await UsageStore.fetchOrg(key: key, now: Date())
-                self.orgWeek = week
-                self.orgToday = today
-                self.orgStatus = "Updated \(Date().formatted(date: .omitted, time: .standard))"
-            } catch let e as OrgError {
-                self.orgStatus = e.message
-            } catch {
-                self.orgStatus = "Network error"
-            }
-        }
-    }
-
-    nonisolated private static func fetchOrg(key: String, now: Date) async throws -> (Tokens, Tokens) {
-        var comps = URLComponents(string: "https://api.anthropic.com/v1/organizations/usage_report/messages")!
-        let iso = ISO8601DateFormatter()
-        let start = Calendar.current.startOfDay(for: now.addingTimeInterval(-6 * 24 * 3600))
-        comps.queryItems = [
-            URLQueryItem(name: "starting_at", value: iso.string(from: start)),
-            URLQueryItem(name: "bucket_width", value: "1d"),
-            URLQueryItem(name: "limit", value: "7"),
-        ]
-        var req = URLRequest(url: comps.url!)
-        req.setValue(key, forHTTPHeaderField: "x-api-key")
-        req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-        req.timeoutInterval = 20
-
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        guard let http = resp as? HTTPURLResponse else { throw OrgError("No response") }
-        switch http.statusCode {
-        case 200: break
-        case 401: throw OrgError("Auth failed — check admin key")
-        case 403: throw OrgError("Key lacks admin permission")
-        default: throw OrgError("HTTP \(http.statusCode)")
-        }
-
-        let report = try JSONDecoder().decode(OrgReport.self, from: data)
-        let todayStart = Calendar.current.startOfDay(for: now)
-        var week = Tokens(); var today = Tokens()
-        for bucket in report.data {
-            var bt = Tokens()
-            for r in bucket.results {
-                bt = bt + Tokens(input: r.uncached_input_tokens ?? 0,
-                                 output: r.output_tokens ?? 0,
-                                 cacheCreate: (r.cache_creation?.ephemeral_1h_input_tokens ?? 0)
-                                            + (r.cache_creation?.ephemeral_5m_input_tokens ?? 0),
-                                 cacheRead: r.cache_read_input_tokens ?? 0)
-            }
-            week = week + bt
-            if let s = iso.date(from: bucket.starting_at), s >= todayStart { today = today + bt }
-        }
-        return (week, today)
     }
 
     // MARK: Scanning (runs off the main actor)
@@ -405,41 +271,6 @@ struct WindowView: View {
     }
 }
 
-/// Official org usage via the Admin API. Separate from local token tracking.
-struct OrgSection: View {
-    @EnvironmentObject var store: UsageStore
-    @State private var keyInput = ""
-    @State private var expanded = false
-
-    var body: some View {
-        DisclosureGroup(isExpanded: $expanded) {
-            VStack(alignment: .leading, spacing: 8) {
-                if store.orgConfigured {
-                    Text(store.orgStatus).font(.system(size: 9)).foregroundStyle(.secondary)
-                    WindowView(title: "Org — this week", subtitle: "API platform", t: store.orgWeek)
-                    WindowView(title: "Org — today", subtitle: nil, t: store.orgToday)
-                    HStack {
-                        Button("Refresh") { store.refreshOrg() }
-                            .buttonStyle(.borderless).font(.system(size: 11))
-                        Spacer()
-                        Button("Remove key") { store.clearOrgKey() }
-                            .buttonStyle(.borderless).font(.system(size: 11)).foregroundStyle(.red)
-                    }
-                } else {
-                    Text("Paste an Admin API key (sk-ant-admin…). Stored in your macOS Keychain. Reports developer-platform org usage — not your seat's plan %.")
-                        .font(.system(size: 9)).foregroundStyle(.secondary)
-                    SecureField("sk-ant-admin…", text: $keyInput)
-                        .textFieldStyle(.roundedBorder).font(.system(size: 11))
-                    Button("Save key") { store.saveOrgKey(keyInput); keyInput = "" }
-                        .font(.system(size: 11))
-                }
-            }.padding(.top, 4)
-        } label: {
-            Text("Org usage (Admin API)").font(.system(size: 12, weight: .semibold))
-        }
-    }
-}
-
 struct MenuContent: View {
     @EnvironmentObject var store: UsageStore
     @State private var launchAtLogin = (SMAppService.mainApp.status == .enabled)
@@ -474,10 +305,6 @@ struct MenuContent: View {
 
             Text("Token counts from local transcripts. Not the same as your plan's % usage, which Anthropic computes server-side.")
                 .font(.system(size: 9)).foregroundStyle(.secondary)
-
-            Divider()
-
-            OrgSection()
 
             Divider()
 
